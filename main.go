@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -15,20 +16,25 @@ import (
 	flag "github.com/spf13/pflag"
 )
 
-type PackageTypes map[string]*doc.Type
+type PackageTypes struct {
+	DocTypes map[string]*doc.Type
+	Imports  map[string]string
+}
 
 var logLine func(args ...any)
 
 func main() {
 	var (
 		pkgName    string
+		fileDir    string
 		configType string
 		genFile    string
 		verbose    bool
 		envFile    string
 	)
 
-	flag.StringVarP(&pkgName, "package", "p", "main", "Name of config type")
+	flag.StringVarP(&pkgName, "package", "p", "", "Name of config type, defaults to dir")
+	flag.StringVarP(&fileDir, "dir", "d", "", "Directory of our config file")
 	flag.StringVarP(&configType, "config", "c", "", "Name of config type")
 	flag.StringVarP(&genFile, "file", "f", "", "Name of generated file to write to")
 	flag.BoolVarP(&verbose, "verbose", "v", false, "verbose logging")
@@ -36,8 +42,13 @@ func main() {
 
 	flag.Parse()
 
+	if pkgName == "" {
+		pkgName = fileDir
+	}
+
 	cfg := GenConfig{
 		PackageName:   pkgName,
+		FileDir:       fileDir,
 		ConfigType:    configType,
 		GoOutputFile:  genFile,
 		EnvOutputFile: envFile,
@@ -50,6 +61,7 @@ func main() {
 
 type GenConfig struct {
 	PackageName   string
+	FileDir       string
 	ConfigType    string
 	GoOutputFile  string
 	EnvOutputFile string
@@ -66,7 +78,7 @@ func GenEnv(cfg GenConfig) error {
 		}
 	}
 
-	fset, pkgTypes, err := loadDocPackage(cfg.PackageName)
+	fset, pkgTypes, err := loadDocPackage(cfg.FileDir, cfg.PackageName)
 	if err != nil {
 		return err
 	}
@@ -86,12 +98,21 @@ func GenEnv(cfg GenConfig) error {
 	for !queue.IsEmpty() {
 		firstType := queue.Pop()
 
-		tpe, found := pkgTypes[firstType]
+		tpe, found := pkgTypes.DocTypes[firstType]
 		if !found {
 			return fmt.Errorf("config type '%v' not found", firstType)
 		}
 
-		b, err := NewStructBuilder(tpe, pkgTypes, cfg.ConfigType, queue, parsers, errs, imports)
+		b, err := NewStructBuilder(
+			tpe,
+			pkgTypes,
+			pkgTypes.Imports,
+			cfg.ConfigType,
+			queue,
+			parsers,
+			errs,
+			imports,
+		)
 		if err != nil {
 			return err
 		}
@@ -99,7 +120,9 @@ func GenEnv(cfg GenConfig) error {
 	}
 
 	// write parsers to W so it can add imports and errors
-	parsers.Write(&w)
+	if err := parsers.Write(&w); err != nil {
+		return err
+	}
 
 	// now write the file in order:
 	// package -> imports -> errors -> configs + parsers -> newline
@@ -119,7 +142,7 @@ func GenEnv(cfg GenConfig) error {
 
 	outputFile := cfg.GoOutputFile
 	if outputFile == "" {
-		tokFile := fset.File(pkgTypes[cfg.ConfigType].Decl.TokPos)
+		tokFile := fset.File(pkgTypes.DocTypes[cfg.ConfigType].Decl.TokPos)
 		nameNoExt := strings.TrimSuffix(tokFile.Name(), ".go")
 		outputFile = nameNoExt + "_gen.go"
 	}
@@ -133,9 +156,12 @@ func GenEnv(cfg GenConfig) error {
 	return nil
 }
 
-func loadDocPackage(pkgName string) (*token.FileSet, PackageTypes, error) {
+func loadDocPackage(dirName, pkgName string) (*token.FileSet, *PackageTypes, error) {
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, "./", nil, parser.ParseComments)
+	pkgs, err := parser.ParseDir(fset, "./"+dirName, func(fi fs.FileInfo) bool {
+		logLine("file found:", fi.Name())
+		return true
+	}, parser.ParseComments)
 	if err != nil {
 		return fset, nil, err
 	}
@@ -150,10 +176,24 @@ func loadDocPackage(pkgName string) (*token.FileSet, PackageTypes, error) {
 	}
 
 	docPkg := doc.New(pkg, "./", 0)
-	pkgTypes := make(PackageTypes)
+	pkgTypes := &PackageTypes{
+		Imports:  make(map[string]string),
+		DocTypes: make(map[string]*doc.Type),
+	}
+
+	for _, files := range pkg.Files {
+		for _, fileImp := range files.Imports {
+			importPath := strings.Trim(fileImp.Path.Value, "\"")
+			split := strings.Split(importPath, "/")
+			importKey := strings.Trim(split[len(split)-1], " ")
+			pkgTypes.Imports[importKey] = importPath
+			logLine("import: [", importKey, "] =", importPath)
+		}
+	}
+	// fmt.Println(pkgTypes.Imports)
 
 	for _, t := range docPkg.Types {
-		pkgTypes[t.Name] = t
+		pkgTypes.DocTypes[t.Name] = t
 	}
 
 	return fset, pkgTypes, nil

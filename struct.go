@@ -8,39 +8,43 @@ import (
 )
 
 type StructBuilder struct {
-	pkgTypes  PackageTypes
+	pkgTypes  *PackageTypes
 	us        *doc.Type
+	file      *ast.File
+	imports   map[string]string
 	name      string
 	rootType  bool
 	buildType string
 
-	queue   *QueueCache
-	parsers *ParserCache
-	errs    *ErrorCache
-	imports *ImportCache
+	queue       *QueueCache
+	parsers     *ParserCache
+	errs        *ErrorCache
+	importCache *ImportCache
 
 	fields map[string]*Field
 }
 
 func NewStructBuilder(
 	tpe *doc.Type,
-	pkgTypes PackageTypes,
+	pkgTypes *PackageTypes,
+	imports map[string]string,
 	rootTypeName string,
 	queue *QueueCache,
 	parsers *ParserCache,
 	errs *ErrorCache,
-	imports *ImportCache,
+	importCache *ImportCache,
 ) (*StructBuilder, error) {
 	b := &StructBuilder{
-		pkgTypes: pkgTypes,
-		us:       tpe,
-		rootType: tpe.Name == rootTypeName,
-		name:     tpe.Name,
-		queue:    queue,
-		parsers:  parsers,
-		errs:     errs,
-		imports:  imports,
-		fields:   make(map[string]*Field),
+		pkgTypes:    pkgTypes,
+		us:          tpe,
+		rootType:    tpe.Name == rootTypeName,
+		name:        tpe.Name,
+		queue:       queue,
+		parsers:     parsers,
+		errs:        errs,
+		imports:     imports,
+		importCache: importCache,
+		fields:      make(map[string]*Field),
 	}
 
 	for _, spec := range b.us.Decl.Specs {
@@ -52,7 +56,7 @@ func NewStructBuilder(
 		}
 
 		for _, field := range structType.Fields.List {
-			newField, err := NewField(field, b.pkgTypes, b.rootType, b.queue, b.parsers, b.errs, b.imports)
+			newField, err := NewField(field, b.pkgTypes, b.imports, b.rootType, b.queue, b.parsers, b.errs, b.importCache)
 			if err != nil {
 				return nil, err
 			}
@@ -86,11 +90,24 @@ func (b *StructBuilder) Write(w io.Writer) error {
 	}
 
 	writeF(w,
-		"var (\nerr error\nc *%v\n)\n\n",
+		"var err error\n\nc := &%v{}\n\n",
 		b.name,
 	)
 
+	f, hasTypeField := b.fields["Type"]
+	if hasTypeField {
+		err := f.Write(w)
+		if err != nil {
+			return err
+		}
+	}
+
 	for _, f := range b.fields {
+		f.hasTypeField = hasTypeField
+		if f.varName == "Type" {
+			continue
+		}
+
 		err := f.Write(w)
 		if err != nil {
 			return err
@@ -108,6 +125,12 @@ func (b *StructBuilder) Write(w io.Writer) error {
 			b.buildType,
 		)
 
+		if strings.Contains(b.buildType, ".") {
+			importName, _, _ := strings.Cut(b.buildType, ".")
+			logLine("adding custom import:", importName, "at", b.imports[importName])
+			b.importCache.Add(importName, b.imports[importName])
+		}
+
 		writeF(
 			w,
 			"switch c.Type {\n",
@@ -122,8 +145,9 @@ func (b *StructBuilder) Write(w io.Writer) error {
 
 			writeF(
 				w,
-				"case \"%v\":\nreturn c.New%v()\n",
+				"case \"%v\":\nreturn c.%v.New%v()\n",
 				f.envKey,
+				f.varName,
 				newFuncName,
 			)
 		}

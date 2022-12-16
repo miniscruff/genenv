@@ -19,38 +19,43 @@ type Field struct {
 	customType    bool
 	rootTypeField bool
 	buildType     string
+	hasTypeField bool
 
-	queue   *QueueCache
-	parsers *ParserCache
-	errs    *ErrorCache
-	imports *ImportCache
+	imports map[string]string
+
+	queue       *QueueCache
+	parsers     *ParserCache
+	errs        *ErrorCache
+	importCache *ImportCache
 }
 
 func NewField(
 	field *ast.Field,
-	pkgTypes PackageTypes,
+	pkgTypes *PackageTypes,
+	imports map[string]string,
 	rootType bool,
 	queue *QueueCache,
 	parsers *ParserCache,
 	errs *ErrorCache,
-	imports *ImportCache,
+	importCache *ImportCache,
 ) (*Field, error) {
 	f := &Field{
 		defaultValue:  "", // default should be empty
 		required:      true,
 		slice:         false,
 		docs:          field.Doc.Text(),
+		imports:       imports,
 		rootTypeField: rootType,
 		queue:         queue,
 		parsers:       parsers,
 		errs:          errs,
-		imports:       imports,
+		importCache:   importCache,
 	}
 
 	switch fieldType := field.Type.(type) {
 	case *ast.Ident:
 		f.typeName = fieldType.Name
-		if _, found := pkgTypes[f.typeName]; found {
+		if _, found := pkgTypes.DocTypes[f.typeName]; found {
 			f.customType = true
 		}
 	case *ast.ArrayType:
@@ -61,12 +66,13 @@ func NewField(
 		rootType := fieldType.X.(*ast.Ident)
 		f.typeName = rootType.Name
 		f.required = false
-		if _, found := pkgTypes[f.typeName]; found {
+		if _, found := pkgTypes.DocTypes[f.typeName]; found {
 			f.customType = true
 		}
 	case *ast.SelectorExpr:
 		rootType := fieldType.Sel
-		f.typeName = rootType.Name
+		f.typeName = fmt.Sprintf("%v.%v", fieldType.X, rootType.Name)
+		logLine("field type:", f.typeName)
 	default:
 		return f, fmt.Errorf("unknown field type: %T for field: '%v'", fieldType, field.Names[0])
 	}
@@ -105,6 +111,16 @@ func (f *Field) Write(w io.Writer) error {
 		envKey = fmt.Sprintf("prefix + \"_%v\"", f.envKey)
 	}
 
+	// if we are part of a conditional type, wrap our new in an if
+	// making sure we are actually using the type
+	if f.hasTypeField {
+		writeF(
+			w,
+			"if c.Type == \"%v\" {\n",
+			f.envKey,
+		)
+	}
+
 	if f.customType {
 		f.queue.Add(f.typeName)
 		writeF(
@@ -114,6 +130,7 @@ func (f *Field) Write(w io.Writer) error {
 			f.typeName,
 			envKey,
 		)
+
 	} else {
 		parserType := f.getParserFunc()
 
@@ -130,6 +147,14 @@ func (f *Field) Write(w io.Writer) error {
 			parseArgs,
 		)
 	}
+
+	if f.hasTypeField {
+		writeF(
+			w,
+			"\n}",
+		)
+	}
+
 	writeF(w, "\n\n")
 
 	return nil
@@ -137,11 +162,12 @@ func (f *Field) Write(w io.Writer) error {
 
 func (f *Field) getParserFunc() string {
 	parser := Parser{
-		ReturnType: f.typeName,
-		IsSlice:    f.slice,
-		IsRequired: f.required,
-		Errs:       f.errs,
-		Imports:    f.imports,
+		ReturnType:  f.typeName,
+		IsSlice:     f.slice,
+		IsRequired:  f.required,
+		Errs:        f.errs,
+		Imports:     f.imports,
+		ImportCache: f.importCache,
 	}
 	f.parsers.Add(parser.FuncName(), parser)
 

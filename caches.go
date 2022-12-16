@@ -14,11 +14,12 @@ type (
 
 	Import string
 	Parser struct {
-		ReturnType string
-		IsSlice    bool
-		IsRequired bool
-		Errs       *ErrorCache
-		Imports    *ImportCache
+		ReturnType  string
+		IsSlice     bool
+		IsRequired  bool
+		Imports     map[string]string
+		Errs        *ErrorCache
+		ImportCache *ImportCache
 	}
 
 	ErrorDef struct {
@@ -87,7 +88,7 @@ func (c *ImportCache) Write(w io.Writer) error {
 		return err
 	}
 
-	for imp := range c.values {
+	for _, imp := range c.values {
 		writeF(w, "\"%v\"\n", imp)
 	}
 
@@ -133,7 +134,7 @@ func (p Parser) FuncName() string {
 
 	return fmt.Sprintf(
 		"Parse%v%v%v",
-		strings.Title(p.ReturnType),
+		strings.ReplaceAll(strings.Title(p.ReturnType), ".", ""),
 		sliceStr,
 		p.RequiredStr(),
 	)
@@ -145,6 +146,13 @@ func (p *Parser) Write(w io.Writer) error {
 		return fmt.Errorf("unknown type: %v", p.ReturnType)
 	}
 
+	for _, imp := range convMap[p.ReturnType].Imports {
+		p.ImportCache.Add(imp, imp)
+	}
+	for _, e := range convMap[p.ReturnType].Errs {
+		p.Errs.Add(e.VarName, e)
+	}
+
 	writeF(
 		w,
 		"func %v(%v) (%v, error) {\nv, ok := os.LookupEnv(key)\nif !ok {\n",
@@ -154,8 +162,8 @@ func (p *Parser) Write(w io.Writer) error {
 	)
 
 	if p.IsRequired {
-		p.Imports.Add("errors", "errors")
-		p.Imports.Add("fmt", "fmt")
+		p.ImportCache.Add("errors", "errors")
+		p.ImportCache.Add("fmt", "fmt")
 		p.Errs.Add("keyNotFound", ErrorDef{
 			VarName: "ErrKeyNotFound",
 			Desc:    "env var key not found",
@@ -185,7 +193,7 @@ func (p *Parser) Write(w io.Writer) error {
 	)
 
 	if p.ReturnType != "string" {
-		p.Imports.Add("strconv", "strconv")
+		p.ImportCache.Add("strconv", "strconv")
 	}
 
 	writeF(w, "\n}\n\n")
@@ -195,14 +203,19 @@ func (p *Parser) Write(w io.Writer) error {
 func (c *ParserCache) Write(w io.Writer) error {
 	for _, parser := range c.values {
 		logLine("parser:", parser.FuncName())
-		parser.Write(w)
+		if err := parser.Write(w); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
 type ConvInfo struct {
 	DefaultValue     string
 	ConvReturnFormat string
+	Imports          []string
+	Errs             []ErrorDef
 }
 
 var convMap = map[string]ConvInfo{
@@ -213,6 +226,34 @@ var convMap = map[string]ConvInfo{
 	"int": {
 		DefaultValue:     "0",
 		ConvReturnFormat: "v64, err := strconv.ParseInt(%v, 10, 64)\nif err != nil {\nreturn 0, err\n}\n\nreturn int(v64), nil",
+	},
+	"bool": {
+		DefaultValue: "false",
+		Imports:      []string{"strings", "fmt", "errors"},
+		Errs: []ErrorDef{
+			{
+				VarName: "ErrInvalidBool",
+				Desc:    "invalid bool value",
+			},
+		},
+		ConvReturnFormat: `switch strings.ToLower(%v) {
+		case "y", "yes", "true", "t", "1", "on":
+			return true, nil
+		case "n", "no", "false", "f", "0", "off":
+			return false, nil
+		default:
+			return false, fmt.Errorf("%%w: %%v", ErrInvalidBool, v)
+		}`,
+	},
+	"time.Duration": {
+		DefaultValue: "0",
+		Imports:      []string{"time"},
+		ConvReturnFormat: `vd, err := time.ParseDuration(%v)
+		if err != nil {
+			return 0, err
+		}
+
+		return vd, nil`,
 	},
 }
 
