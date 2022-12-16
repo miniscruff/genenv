@@ -135,9 +135,13 @@ func GenEnv(cfg GenConfig) error {
 
 func loadDocPackage(pkgName string) (*token.FileSet, PackageTypes, error) {
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, "./", nil, parser.ParseComments)
+	pkgs, err := parser.ParseDir(fset, "./...", nil, parser.ParseComments)
 	if err != nil {
 		return fset, nil, err
+	}
+
+	for name := range pkgs {
+		logLine("package found:", name)
 	}
 
 	pkg, found := pkgs[pkgName]
